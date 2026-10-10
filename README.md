@@ -27,7 +27,7 @@ It won't work with AMD or Intel graphics.
 4. Right-click the tray icon > **Settings** to:
    - change the shortcuts
    - hide inputs you don't use
-   - list games that should never be switched away from
+   - list games: while a game's window is selected, the shortcuts do nothing (running in the background doesn't count)
 
 Settings are saved in `lg-input-switcher.ini` next to the exe.
 

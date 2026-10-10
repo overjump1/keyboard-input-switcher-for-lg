@@ -75,11 +75,11 @@ namespace LgInputSwitcher
             root.Controls.Add(inputsBox);
 
             // --- Block programs -----------------------------------------------------
-            var blockBox = new GroupBox { Text = "Don't switch while these programs are focused", AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(8) };
+            var blockBox = new GroupBox { Text = "Don't switch while one of these programs' window is selected", AutoSize = true, Dock = DockStyle.Fill, Padding = new Padding(8) };
             var blockLayout = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Fill };
             blockBox.Controls.Add(blockLayout);
 
-            var blockHint = Hint("Shortcuts do nothing while one of these is the active window, so a stray key press can't switch you out of a game.");
+            var blockHint = Hint("Shortcuts do nothing while you're in one of these windows, so a stray key press can't switch you out of a game. Running in the background or minimized doesn't count.");
             blockHint.MaximumSize = new Size(560, 0);
             blockLayout.Controls.Add(blockHint);
             blockLayout.SetColumnSpan(blockHint, 2);

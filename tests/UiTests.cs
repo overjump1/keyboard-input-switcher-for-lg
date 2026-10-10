@@ -63,7 +63,7 @@ namespace LgInputSwitcher.Tests
                 Run("Tray menu: every visible input item switches to that input", Menu_InputItemsSwitch);
                 Run("Tray menu: hidden inputs are left out", Menu_HiddenInputsLeftOut);
                 Run("Hotkeys: pressing each shortcut switches", Hotkeys_Switch);
-                Run("Hotkeys: ignored while a blocked program is focused", Hotkeys_BlockedProgram);
+                Run("Hotkeys: ignored only while a blocked program's window is selected", Hotkeys_BlockedProgram);
                 Run("Tray menu: Reload settings file picks up hand edits", Menu_ReloadSettingsFile);
                 Run("Tray menu: Settings... opens one window and releases hotkeys", Menu_SettingsOpens);
                 Run("Tray icon: double-click opens Settings", Tray_DoubleClickOpensSettings);
@@ -157,25 +157,52 @@ namespace LgInputSwitcher.Tests
             }
         }
 
+        // Character Map stands in for a game: it is on the block list and running the whole time.
+        // Only while its window is the selected one may the shortcut be ignored.
         private static void Hotkeys_BlockedProgram()
         {
-            string fg = Foreground.ExeName();
-            Check(fg != null, "found the focused program (" + (fg ?? "none") + ")");
-            if (fg == null) return;
+            var game = Process.Start(Path.Combine(Environment.SystemDirectory, "charmap.exe"));
+            var other = new Form { Text = "Some other window", ShowInTaskbar = false, Width = 300, Height = 120 };
+            try
+            {
+                game.WaitForInputIdle(5000);
+                WaitFor(() => { game.Refresh(); return game.MainWindowHandle != IntPtr.Zero; });
+                SetIniLine("programs", "programs = charmap.exe");
+                MenuItem("Reload settings file").PerformClick();
+                Pump(100);
 
-            SetIniLine("programs", "programs = " + fg);
-            MenuItem("Reload settings file").PerformClick();
-            Pump(100);
-            _fake.Switched.Clear();
-            PressCtrlAlt(0x7C);
-            Pump(400);
-            Check(_fake.Switched.Count == 0, "no switch while " + fg + " is focused, got " + Codes(_fake.Switched));
+                // Game running, but another window is selected: the shortcut must work.
+                other.Show();
+                BringToFront(other);
+                Check(Foreground.ExeName() != "charmap.exe", "another window is selected (" + Foreground.ExeName() + ")");
+                _fake.Switched.Clear();
+                PressCtrlAlt(0x7C);
+                Check(WaitFor(() => _fake.Switched.Count == 1, 1000), "switches while charmap.exe only runs in the background, got " + Codes(_fake.Switched));
 
-            SetIniLine("programs", "programs =");
-            MenuItem("Reload settings file").PerformClick();
-            Pump(100);
-            PressCtrlAlt(0x7C);
-            Check(WaitFor(() => _fake.Switched.Count == 1, 1000), "switches again once unblocked");
+                // Game window selected: the shortcut must do nothing.
+                Check(BringToFront(game.MainWindowHandle), "Character Map window selected");
+                Check(Foreground.ExeName() == "charmap.exe", "focused program is " + Foreground.ExeName());
+                _fake.Switched.Clear();
+                PressCtrlAlt(0x7C);
+                Pump(400);
+                Check(_fake.Switched.Count == 0, "no switch while charmap.exe is selected, got " + Codes(_fake.Switched));
+
+                // Game minimized (still running): the shortcut works again.
+                ShowWindow(game.MainWindowHandle, 6 /* SW_MINIMIZE */);
+                BringToFront(other);
+                _fake.Switched.Clear();
+                PressCtrlAlt(0x7C);
+                Check(WaitFor(() => _fake.Switched.Count == 1, 1000), "switches while charmap.exe is minimized, got " + Codes(_fake.Switched));
+            }
+            finally
+            {
+                other.Dispose();
+                if (!game.HasExited) game.Kill();
+                game.Dispose();
+                SetIniLine("programs", "programs =");
+                MenuItem("Reload settings file").PerformClick();
+                Pump(100);
+            }
         }
 
         private static void Menu_ReloadSettingsFile()
@@ -664,27 +691,33 @@ namespace LgInputSwitcher.Tests
         [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+        [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr h, int cmd);
 
         // Windows refuses SetForegroundWindow from a background process; sharing input state with
         // the current foreground thread lifts that, without sending keys anywhere.
         private static void BringToFront(Form f)
         {
+            BringToFront(f.Handle);
+            f.Activate();
+        }
+
+        private static bool BringToFront(IntPtr window)
+        {
             IntPtr fg = GetForegroundWindow();
-            if (fg == f.Handle) return;
+            if (fg == window) return true;
             uint pid;
             uint fgThread = GetWindowThreadProcessId(fg, out pid);
             uint me = GetCurrentThreadId();
             bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
             try
             {
-                SetForegroundWindow(f.Handle);
-                f.Activate();
+                SetForegroundWindow(window);
             }
             finally
             {
                 if (attached) AttachThreadInput(me, fgThread, false);
             }
-            WaitFor(() => GetForegroundWindow() == f.Handle, 1000);
+            return WaitFor(() => GetForegroundWindow() == window, 1000);
         }
 
         private static ContextMenuStrip OpenContextMenu()

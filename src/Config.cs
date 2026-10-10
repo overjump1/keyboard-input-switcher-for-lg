@@ -123,7 +123,8 @@ namespace LgInputSwitcher
             sb.AppendLine("hide = " + string.Join(" ", Hidden.OrderBy(h => h)));
             sb.AppendLine();
             sb.AppendLine("[block]");
-            sb.AppendLine("; Shortcuts do nothing while one of these programs is the focused window (comma-separated).");
+            sb.AppendLine("; Shortcuts do nothing while a window of one of these programs is selected (comma-separated).");
+            sb.AppendLine("; Running in the background or minimized doesn't count.");
             sb.AppendLine("programs = " + string.Join(", ", BlockPrograms));
             File.WriteAllText(PathNextToExe, sb.ToString());
         }
