@@ -43,3 +43,7 @@ Only the screen switches. Your keyboard stays connected to this PC, so the short
 ## Credits
 
 The LG input command comes from [kaleb422/NVapi-write-value-to-monitor](https://github.com/kaleb422/NVapi-write-value-to-monitor) and [ddcutil issue #100](https://github.com/rockowitz/ddcutil/issues/100).
+
+## License
+
+Public domain ([The Unlicense](LICENSE)). The NVIDIA NVAPI values used are MIT licensed; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
