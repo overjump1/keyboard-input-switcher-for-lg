@@ -3,3 +3,4 @@ tests/out/
 dist/
 *.zip
 *.ini
+*.log

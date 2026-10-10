@@ -22,6 +22,7 @@ namespace LgInputSwitcher.Tests
         public readonly List<byte> Switched = new List<byte>();
         public MonitorReading NextReading;
         public int Reads;
+        public string FailWith; // when set, SwitchTo throws like a failed I2C write
 
         public MonitorReading Read()
         {
@@ -31,6 +32,7 @@ namespace LgInputSwitcher.Tests
 
         public void SwitchTo(InputDef input)
         {
+            if (FailWith != null) throw new NvapiException(FailWith);
             Switched.Add(input.Code);
         }
     }
@@ -64,7 +66,9 @@ namespace LgInputSwitcher.Tests
                 Run("Tray menu: hidden inputs are left out", Menu_HiddenInputsLeftOut);
                 Run("Hotkeys: pressing each shortcut switches", Hotkeys_Switch);
                 Run("Hotkeys: ignored only while a blocked program's window is selected", Hotkeys_BlockedProgram);
+                Run("Hotkeys: a failed switch is logged and reported", Hotkeys_FailedSwitchIsLogged);
                 Run("Tray menu: Reload settings file picks up hand edits", Menu_ReloadSettingsFile);
+                Run("Tray menu: Open log opens it in Notepad", Menu_OpenLog);
                 Run("Tray menu: Settings... opens one window and releases hotkeys", Menu_SettingsOpens);
                 Run("Tray icon: double-click opens Settings", Tray_DoubleClickOpensSettings);
                 Run("Settings: Cancel button closes without saving", Settings_CancelButton);
@@ -174,18 +178,26 @@ namespace LgInputSwitcher.Tests
                 // Game running, but another window is selected: the shortcut must work.
                 other.Show();
                 BringToFront(other);
-                Check(Foreground.ExeName() != "charmap.exe", "another window is selected (" + Foreground.ExeName() + ")");
+                string selected = Foreground.ExeName();
+                Check(selected != "charmap.exe", "another window is selected (" + selected + ")");
                 _fake.Switched.Clear();
+                long logStart = LogLength();
                 PressCtrlAlt(0x7C);
                 Check(WaitFor(() => _fake.Switched.Count == 1, 1000), "switches while charmap.exe only runs in the background, got " + Codes(_fake.Switched));
+                string log = LogSince(logStart);
+                Check(log.Contains("Shortcut Ctrl+Alt+F13 (HDMI 1): selected window belongs to " + selected), "log records the press and selected program: " + log.Trim());
+                Check(log.Contains("Switched to HDMI 1"), "log records the switch");
 
                 // Game window selected: the shortcut must do nothing.
                 Check(BringToFront(game.MainWindowHandle), "Character Map window selected");
                 Check(Foreground.ExeName() == "charmap.exe", "focused program is " + Foreground.ExeName());
                 _fake.Switched.Clear();
+                logStart = LogLength();
                 PressCtrlAlt(0x7C);
                 Pump(400);
                 Check(_fake.Switched.Count == 0, "no switch while charmap.exe is selected, got " + Codes(_fake.Switched));
+                log = LogSince(logStart);
+                Check(log.Contains("blocked, selected window belongs to charmap.exe"), "log records the block: " + log.Trim());
 
                 // Game minimized (still running): the shortcut works again.
                 ShowWindow(game.MainWindowHandle, 6 /* SW_MINIMIZE */);
@@ -202,6 +214,48 @@ namespace LgInputSwitcher.Tests
                 SetIniLine("programs", "programs =");
                 MenuItem("Reload settings file").PerformClick();
                 Pump(100);
+            }
+        }
+
+        private static void Hotkeys_FailedSwitchIsLogged()
+        {
+            _fake.FailWith = "NvAPI_I2CWrite failed (test)";
+            try
+            {
+                long logStart = LogLength();
+                PressCtrlAlt(0x7C);
+                Check(WaitFor(() => LogSince(logStart).Contains("FAILED"), 1000), "failure logged");
+                string log = LogSince(logStart);
+                Check(log.Contains("Switch to HDMI 1 FAILED: NvAPI_I2CWrite failed (test)"), "log has the error: " + log.Trim());
+                Check(log.Contains("Notification: Could not switch to HDMI 1"), "user was notified");
+            }
+            finally
+            {
+                _fake.FailWith = null;
+            }
+        }
+
+        private static void Menu_OpenLog()
+        {
+            DateTime start = DateTime.Now.AddSeconds(-1);
+            MenuItem("Open log").PerformClick();
+            Process opened = null;
+            Check(WaitFor(() => (opened = FindNotepadWith(Log.PathNextToExe, start)) != null, 5000), "Notepad opened with " + Log.PathNextToExe);
+            if (opened != null) { opened.Kill(); opened.Dispose(); }
+        }
+
+        private static long LogLength()
+        {
+            return File.Exists(Log.PathNextToExe) ? new FileInfo(Log.PathNextToExe).Length : 0;
+        }
+
+        private static string LogSince(long offset)
+        {
+            if (!File.Exists(Log.PathNextToExe)) return "";
+            using (var fs = new FileStream(Log.PathNextToExe, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                fs.Seek(Math.Min(offset, fs.Length), SeekOrigin.Begin);
+                return new StreamReader(fs, Encoding.UTF8).ReadToEnd();
             }
         }
 

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -34,6 +35,7 @@ namespace LgInputSwitcher
             _hotkeys.HotkeyPressed += OnHotkey;
             _tray = new NotifyIcon { Icon = CreateIcon(), Text = AppInfo.Name, Visible = true };
             _tray.MouseDoubleClick += delegate { ShowSettings(); };
+            Log.Write("Started");
             LoadSettings(null);
             // The inputs are cached in the ini; Settings > Detect again refreshes them.
             if (_config.InputCodesDetected.Count == 0) DetectInBackground();
@@ -79,8 +81,13 @@ namespace LgInputSwitcher
         {
             _hotkeys.UnregisterAll();
             var failed = new List<string>();
-            if (_settings != null) return failed; // released while Settings records new shortcuts
+            if (_settings != null)
+            {
+                Log.Write("Shortcuts released while Settings is open");
+                return failed; // released while Settings records new shortcuts
+            }
 
+            var registered = new List<string>();
             for (int i = 0; i < _inputs.Count; i++)
             {
                 InputDef input = _inputs[i];
@@ -91,7 +98,13 @@ namespace LgInputSwitcher
                     failed.Add(input.Hotkey + " (not understood)");
                 else if (!_hotkeys.Register(i, mods, key))
                     failed.Add(input.Hotkey + " (in use by another app)");
+                else
+                    registered.Add(input.Hotkey + " = " + input.Label);
             }
+            Log.Write("Shortcuts active: {0}{1}; blocked programs: {2}",
+                registered.Count > 0 ? string.Join(", ", registered) : "none",
+                failed.Count > 0 ? "; NOT registered: " + string.Join(", ", failed) : "",
+                _config.BlockPrograms.Count > 0 ? string.Join(", ", _config.BlockPrograms) : "none");
             return failed;
         }
 
@@ -159,7 +172,11 @@ namespace LgInputSwitcher
             {
                 if (input.Hidden || input.LgValue == null) continue;
                 InputDef captured = input;
-                var item = new ToolStripMenuItem(input.Label, null, delegate { Switch(captured); });
+                var item = new ToolStripMenuItem(input.Label, null, delegate
+                {
+                    Log.Write("Menu: {0}", captured.Label);
+                    Switch(captured);
+                });
                 if (!string.IsNullOrEmpty(input.Hotkey)) item.ShortcutKeyDisplayString = input.Hotkey;
                 menu.Items.Add(item);
             }
@@ -177,6 +194,11 @@ namespace LgInputSwitcher
             menu.Items.Add(startup);
             menu.Items.Add("Edit settings file", null, delegate { Process.Start("notepad.exe", "\"" + Config.PathNextToExe + "\""); });
             menu.Items.Add("Reload settings file", null, delegate { LoadSettings("Settings reloaded"); });
+            menu.Items.Add("Open log", null, delegate
+            {
+                if (!File.Exists(Log.PathNextToExe)) Log.Write("Log opened");
+                Process.Start("notepad.exe", "\"" + Log.PathNextToExe + "\"");
+            });
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add("Exit", null, delegate { ExitThread(); });
 
@@ -188,9 +210,16 @@ namespace LgInputSwitcher
         private void OnHotkey(int id)
         {
             if (id < 0 || id >= _inputs.Count) return;
-            // Never switch away from a blocked program (e.g. a game) while it's in front.
-            if (_config.IsBlocked(Foreground.ExeName())) return;
-            Switch(_inputs[id]);
+            InputDef input = _inputs[id];
+            string selected = Foreground.ExeName();
+            // Never switch away from a blocked program (e.g. a game) while its window is selected.
+            if (_config.IsBlocked(selected))
+            {
+                Log.Write("Shortcut {0} ({1}): blocked, selected window belongs to {2}", input.Hotkey, input.Label, selected);
+                return;
+            }
+            Log.Write("Shortcut {0} ({1}): selected window belongs to {2}", input.Hotkey, input.Label, selected ?? "(unknown)");
+            Switch(input);
         }
 
         private void Switch(InputDef input)
@@ -198,10 +227,12 @@ namespace LgInputSwitcher
             try
             {
                 Switcher.SwitchTo(input);
+                Log.Write("Switched to {0}", input.Label);
                 _tray.Text = Truncate(AppInfo.Name + " - " + input.Label, 63);
             }
             catch (Exception e)
             {
+                Log.Write("Switch to {0} FAILED: {1}", input.Label, e.Message);
                 Notify("Could not switch to " + input.Label + ":\n" + e.Message, ToolTipIcon.Error);
             }
         }
@@ -238,6 +269,7 @@ namespace LgInputSwitcher
 
         private void Notify(string text, ToolTipIcon icon)
         {
+            Log.Write("Notification: {0}", text.Replace("\n", " "));
             _tray.ShowBalloonTip(4000, AppInfo.Name, text, icon);
         }
 
@@ -284,6 +316,7 @@ namespace LgInputSwitcher
         // the context, so otherwise a ghost icon stays in the tray until the mouse passes over it.
         protected override void ExitThreadCore()
         {
+            Log.Write("Exit");
             if (_settings != null) _settings.Dispose();
             _hotkeys.UnregisterAll();
             _tray.Visible = false;

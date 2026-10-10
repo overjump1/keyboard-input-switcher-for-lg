@@ -166,6 +166,7 @@ namespace LgInputSwitcher
                 }
                 catch (NvapiException e)
                 {
+                    Log.Write("I2C write attempt {0} failed: {1}", attempt + 1, e.Message);
                     last = e;
                     Thread.Sleep(100);
                 }
