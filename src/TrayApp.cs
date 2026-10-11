@@ -281,9 +281,10 @@ namespace LgInputSwitcher
         }
 
         // Windows keeps a per-entry approval record next to the Run key (what Task Manager's Startup
-        // tab toggles): first byte 02 = enabled, 03 = disabled. On this Windows 11 build, Run entries
-        // without a record were skipped at sign-in while every entry marked 02 ran, so the app
-        // writes the record itself.
+        // tab toggles): first byte 02 = enabled, 03 = disabled. The app writes it alongside the Run
+        // value so the entry shows as enabled. Note: if this app is started by a packaged (MSIX)
+        // app, e.g. from a terminal inside one, Windows redirects these registry writes into that
+        // package's private copy and sign-in never sees them; start it from Explorer instead.
         private static readonly byte[] ApprovedEnabled = { 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
 
         private static bool IsStartupEnabled()
