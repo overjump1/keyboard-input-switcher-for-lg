@@ -44,6 +44,7 @@ namespace LgInputSwitcher.Tests
     {
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValue = AppInfo.Name;
+        private const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
         private const uint MOD_ALT = 0x1, MOD_CONTROL = 0x2;
 
         private static int _passed, _failed;
@@ -58,6 +59,7 @@ namespace LgInputSwitcher.Tests
         {
             Application.EnableVisualStyles();
             _originalRun = Registry.CurrentUser.OpenSubKey(RunKey).GetValue(RunValue);
+            _originalApproved = Approval();
             try
             {
                 Run("Startup: detects the monitor and saves its inputs", Startup_DetectsAndSaves);
@@ -84,7 +86,8 @@ namespace LgInputSwitcher.Tests
                 Run("Settings: Remove deletes the selected programs", Settings_Remove);
                 Run("Settings: Save writes the file and applies everything", Settings_Save);
                 Run("Settings: Enter key saves", Settings_EnterSaves);
-                Run("Tray menu: Start with Windows toggles the Run entry", Menu_StartWithWindows);
+                Run("Tray menu: Start with Windows toggles the Run entry and its approval record", Menu_StartWithWindows);
+                Run("Startup: repairs a Start with Windows entry Windows would skip", Startup_RepairsEntry);
                 Run("Tray menu: Edit settings file opens it in Notepad", Menu_EditSettingsFile);
                 Run("Tray menu: Exit ends the app and removes the icon", Menu_Exit);
             }
@@ -493,16 +496,62 @@ namespace LgInputSwitcher.Tests
         private static void Menu_StartWithWindows()
         {
             ToolStripMenuItem item = (ToolStripMenuItem)MenuItem("Start with Windows");
-            bool before = item.Checked;
-            item.PerformClick();
-            object value = Registry.CurrentUser.OpenSubKey(RunKey).GetValue(RunValue);
-            Check(item.Checked == !before, "tick toggled");
-            Check(item.Checked ? value as string == "\"" + Application.ExecutablePath + "\"" : value == null,
-                "Run entry " + (item.Checked ? "points at the exe" : "removed") + " (value: " + (value ?? "none") + ")");
-            item.PerformClick();
-            value = Registry.CurrentUser.OpenSubKey(RunKey).GetValue(RunValue);
-            Check(item.Checked == before, "tick toggled back");
-            Check(item.Checked ? value != null : value == null, "Run entry toggled back");
+            string exe = "\"" + Application.ExecutablePath + "\"";
+            for (int round = 0; round < 2; round++)
+            {
+                bool before = item.Checked;
+                item.PerformClick();
+                Check(item.Checked == !before, "tick toggled (" + (item.Checked ? "on" : "off") + ")");
+                if (item.Checked)
+                {
+                    Check(RunEntry() == exe, "Run entry points at the exe (value: " + (RunEntry() ?? "none") + ")");
+                    byte[] approved = Approval();
+                    Check(approved != null && approved.Length == 12 && approved[0] == 0x02, "Windows approval record says enabled (" + Hex(approved) + ")");
+                }
+                else
+                {
+                    Check(RunEntry() == null, "Run entry removed");
+                    Check(Approval() == null, "approval record removed");
+                }
+            }
+        }
+
+        private static readonly MethodInfo Repair = typeof(TrayApp).GetMethod("RepairStartupEntry", BindingFlags.NonPublic | BindingFlags.Static);
+
+        private static void Startup_RepairsEntry()
+        {
+            string exe = "\"" + Application.ExecutablePath + "\"";
+            using (RegistryKey run = Registry.CurrentUser.CreateSubKey(RunKey))
+            using (RegistryKey approved = Registry.CurrentUser.CreateSubKey(ApprovedKey))
+            {
+                // Entry without an approval record (what Windows skipped at sign-in): repaired.
+                run.SetValue(RunValue, exe);
+                approved.DeleteValue(RunValue, false);
+                Repair.Invoke(null, null);
+                Check(Approval() != null && Approval()[0] == 0x02, "missing approval record added as enabled (" + Hex(Approval()) + ")");
+
+                // Entry pointing at an old exe location: updated.
+                run.SetValue(RunValue, "\"C:\\old place\\lg-input-switcher.exe\"");
+                Repair.Invoke(null, null);
+                Check(RunEntry() == exe, "moved exe path updated (value: " + RunEntry() + ")");
+
+                // Disabled by the user (e.g. in Task Manager): left alone.
+                var disabled = new byte[] { 0x03, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+                approved.SetValue(RunValue, disabled, RegistryValueKind.Binary);
+                Repair.Invoke(null, null);
+                Check(Hex(Approval()) == Hex(disabled), "user's disabled record kept (" + Hex(Approval()) + ")");
+
+                // Start with Windows off: nothing created.
+                run.DeleteValue(RunValue, false);
+                approved.DeleteValue(RunValue, false);
+                Repair.Invoke(null, null);
+                Check(RunEntry() == null && Approval() == null, "nothing added when Start with Windows is off");
+            }
+        }
+
+        private static string Hex(byte[] bytes)
+        {
+            return bytes == null ? "none" : BitConverter.ToString(bytes);
         }
 
         private static void Menu_EditSettingsFile()
@@ -804,7 +853,7 @@ namespace LgInputSwitcher.Tests
         // ---------------------------------------------------------------- helpers: general
 
         private static System.Threading.Timer _watchdog;
-        private static object _originalRun;
+        private static object _originalRun, _originalApproved;
 
         // Ends the run if a test is stuck (e.g. an unanswered modal dialog), restoring the Run entry.
         private static void ArmWatchdog(string name)
@@ -825,6 +874,23 @@ namespace LgInputSwitcher.Tests
                 if (_originalRun != null) key.SetValue(RunValue, _originalRun);
                 else key.DeleteValue(RunValue, false);
             }
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(ApprovedKey))
+            {
+                if (_originalApproved != null) key.SetValue(RunValue, _originalApproved, RegistryValueKind.Binary);
+                else key.DeleteValue(RunValue, false);
+            }
+        }
+
+        private static byte[] Approval()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(ApprovedKey))
+                return key == null ? null : key.GetValue(RunValue) as byte[];
+        }
+
+        private static string RunEntry()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey))
+                return key == null ? null : key.GetValue(RunValue) as string;
         }
 
         private static void Run(string name, Action test)

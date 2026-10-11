@@ -16,6 +16,7 @@ namespace LgInputSwitcher
     {
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunValue = AppInfo.Name;
+        private const string StartupApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 
         private readonly NotifyIcon _tray;
         private readonly HotkeyWindow _hotkeys;
@@ -36,6 +37,7 @@ namespace LgInputSwitcher
             _tray = new NotifyIcon { Icon = CreateIcon(), Text = AppInfo.Name, Visible = true };
             _tray.MouseDoubleClick += delegate { ShowSettings(); };
             Log.Write("Started");
+            RepairStartupEntry();
             LoadSettings(null);
             // The inputs are cached in the ini; Settings > Detect again refreshes them.
             if (_config.InputCodesDetected.Count == 0) DetectInBackground();
@@ -278,10 +280,18 @@ namespace LgInputSwitcher
             return s.Length <= max ? s : s.Substring(0, max);
         }
 
+        // Windows keeps a per-entry approval record next to the Run key (what Task Manager's Startup
+        // tab toggles): first byte 02 = enabled, 03 = disabled. On this Windows 11 build, Run entries
+        // without a record were skipped at sign-in while every entry marked 02 ran, so the app
+        // writes the record itself.
+        private static readonly byte[] ApprovedEnabled = { 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
         private static bool IsStartupEnabled()
         {
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey))
-                return key != null && key.GetValue(RunValue) != null;
+                if (key == null || key.GetValue(RunValue) == null) return false;
+            byte[] approved = ReadApproval();
+            return approved == null || approved.Length == 0 || (approved[0] & 1) == 0;
         }
 
         private static void SetStartup(bool enable)
@@ -291,6 +301,43 @@ namespace LgInputSwitcher
                 if (enable) key.SetValue(RunValue, "\"" + Application.ExecutablePath + "\"");
                 else key.DeleteValue(RunValue, false);
             }
+            using (RegistryKey key = Registry.CurrentUser.CreateSubKey(StartupApprovedKey))
+            {
+                if (enable) key.SetValue(RunValue, ApprovedEnabled, RegistryValueKind.Binary);
+                else key.DeleteValue(RunValue, false);
+            }
+            Log.Write("Start with Windows {0}", enable ? "enabled" : "disabled");
+        }
+
+        // If "Start with Windows" is on but the approval record is missing (or the exe moved),
+        // repair it so the next sign-in actually starts the app. A record the user set to
+        // disabled (e.g. in Task Manager) is left alone.
+        private static void RepairStartupEntry()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey))
+                    if (key == null || key.GetValue(RunValue) == null) return;
+                byte[] approved = ReadApproval();
+                if (approved != null && approved.Length > 0 && (approved[0] & 1) != 0) return;
+
+                string expected = "\"" + Application.ExecutablePath + "\"";
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey))
+                    if (approved != null && expected.Equals(key.GetValue(RunValue) as string, StringComparison.OrdinalIgnoreCase)) return;
+
+                SetStartup(true);
+                Log.Write("Repaired the Start with Windows entry");
+            }
+            catch (Exception e)
+            {
+                Log.Write("Could not repair the Start with Windows entry: {0}", e.Message);
+            }
+        }
+
+        private static byte[] ReadApproval()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(StartupApprovedKey))
+                return key == null ? null : key.GetValue(RunValue) as byte[];
         }
 
         private static Icon CreateIcon()
