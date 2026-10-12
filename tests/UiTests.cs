@@ -58,7 +58,7 @@ namespace LgInputSwitcher.Tests
         private static int Main()
         {
             Application.EnableVisualStyles();
-            _originalRun = Registry.CurrentUser.OpenSubKey(RunKey).GetValue(RunValue);
+            _originalRun = RunEntry(); // the Run key may not exist at all on a fresh machine
             _originalApproved = Approval();
             try
             {
