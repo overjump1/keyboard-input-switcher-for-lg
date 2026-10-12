@@ -745,9 +745,17 @@ namespace LgInputSwitcher.Tests
             {
                 IntPtr dlg = WaitForOwnDialog(AppInfo.Name, 5000);
                 if (dlg == IntPtr.Zero) return;
-                var sb = new StringBuilder(1024);
-                GetWindowText(GetDlgItem(dlg, 0xFFFF), sb, sb.Capacity);
-                text = sb.ToString();
+                // The window can be found before its message text is filled in (seen on fast CI
+                // machines), so wait for the text rather than reading it once.
+                var sw = Stopwatch.StartNew();
+                do
+                {
+                    var sb = new StringBuilder(1024);
+                    GetWindowText(GetDlgItem(dlg, 0xFFFF), sb, sb.Capacity);
+                    text = sb.ToString();
+                    if (text.Length > 0) break;
+                    Thread.Sleep(20);
+                } while (sw.ElapsedMilliseconds < 3000);
                 PostMessage(dlg, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             });
             trigger();
