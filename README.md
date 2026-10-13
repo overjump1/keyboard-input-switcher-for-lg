@@ -9,7 +9,7 @@ Switch your LG monitor's input (HDMI 1, HDMI 2, DisplayPort) with a keyboard sho
 
 - LG 27GR83Q-B (UltraGear), connected over DisplayPort
 - NVIDIA GeForce RTX 3070
-- Windows 11
+- Windows 11, and Bazzite (Linux) with the Linux version
 
 ## Should work on
 
@@ -37,7 +37,7 @@ Only the screen switches. Your keyboard stays connected to this PC, so the short
 
 A single Python script, `linux/lg-input-switcher`, made for Bazzite but fine on any Linux with Python 3. It needs no extra packages and works with KDE, GNOME and Steam's Game Mode. There is no tray icon: you edit the settings in a file.
 
-**Not tested on real hardware yet.** The parts that run without a monitor are tested in CI.
+Tested on Bazzite with an LG 27GR83Q-B on an NVIDIA graphics card. The parts that run without a monitor are also tested in CI.
 
 ### Set up
 
