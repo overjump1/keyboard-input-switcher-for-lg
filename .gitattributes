@@ -1,0 +1,2 @@
+# The Linux script must keep LF line endings, or its #!/usr/bin/env python3 line breaks.
+linux/** text eol=lf
