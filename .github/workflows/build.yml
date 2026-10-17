@@ -10,7 +10,18 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux tests
+        run: |
+          python3 -m py_compile linux/lg-input-switcher
+          python3 -m unittest discover -s linux/tests -v
+
   build:
+    needs: linux
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -35,7 +46,7 @@ jobs:
           name: lg-input-switcher
           path: dist/
 
-      # Every push to main publishes a release with the exe.
+      # Every push to main publishes a release with the exe and the Linux script.
       - name: Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: powershell
@@ -43,6 +54,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "v1.0.${{ github.run_number }}"
-          gh release create $tag lg-input-switcher.zip bin\lg-input-switcher.exe bin\lg-input-switcher-cli.exe `
+          gh release create $tag lg-input-switcher.zip bin\lg-input-switcher.exe bin\lg-input-switcher-cli.exe linux\lg-input-switcher `
             --title $tag `
-            --notes "Unofficial, AI-assisted build. Download lg-input-switcher.exe and run it. See the README for supported hardware."
+            --notes "Unofficial, AI-assisted build. Windows: download lg-input-switcher.exe and run it. Linux: download lg-input-switcher (no extension) and see the README. See the README for supported hardware."

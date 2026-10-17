@@ -1,0 +1,1194 @@
+#!/usr/bin/env python3
+# Keyboard Input Switcher for LG, Linux version (made for Bazzite; plain Python 3, no extra packages).
+#
+# Switches an LG monitor's input with LG's non-standard DDC command: VCP 0xF4 sent with source
+# address 0x50 (standard DDC/CI uses 0x51, which LG ignores for input select). On Linux the command
+# goes through the kernel's /dev/i2c-* devices, so it works with any graphics driver that exposes
+# the monitor's DDC bus (NVIDIA, AMD and Intel all do).
+#
+#   lg-input-switcher hdmi1        switch now (also: dp1, hdmi2, ...)
+#   lg-input-switcher daemon       watch the keyboard for the shortcuts (what "install" sets up)
+#   lg-input-switcher install      copy to ~/.local/bin and start the shortcut service at login
+#   lg-input-switcher doctor       check what's missing
+#
+# Unofficial. Not made by, affiliated with, or endorsed by LG Electronics. Public domain (Unlicense).
+
+import errno
+import glob
+import os
+import re
+import select
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+APP_NAME = "Keyboard Input Switcher for LG"
+APP_ID = "lg-input-switcher"
+
+
+def _xdg(var, fallback):
+    return os.environ.get(var) or os.path.join(os.path.expanduser("~"), fallback)
+
+
+CONFIG_DIR = os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), APP_ID)
+CONFIG_PATH = os.path.join(CONFIG_DIR, APP_ID + ".ini")
+LOG_PATH = os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), APP_ID, APP_ID + ".log")
+BIN_PATH = os.path.join(os.path.expanduser("~"), ".local", "bin", APP_ID)
+UNIT_PATH = os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), "systemd", "user", APP_ID + ".service")
+APPS_DIR = os.path.join(_xdg("XDG_DATA_HOME", ".local/share"), "applications")
+X11_SOCKET = "/tmp/.X11-unix/X%d"
+
+
+class SwitchError(Exception):
+    pass
+
+
+# --- Log ---------------------------------------------------------------------------------------
+
+def log(fmt, *args):
+    # Shortcut presses, the selected program, blocks and switch results. Also printed for journalctl.
+    line = time.strftime("%Y-%m-%d %H:%M:%S") + "  " + (fmt % args if args else fmt)
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 256 * 1024:
+            with open(LOG_PATH, encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            text = text[len(text) // 2:]  # keep the newer half
+            with open(LOG_PATH, "w", encoding="utf-8") as f:
+                f.write(text[text.find("\n") + 1:])
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass  # logging must never break switching
+    if os.environ.get("INVOCATION_ID") or sys.stderr.isatty():  # under systemd this goes to the journal
+        print(line, file=sys.stderr, flush=True)
+
+
+def notify(summary, body):
+    # Desktop notification through D-Bus (gdbus ships with every GNOME and KDE system).
+    def gv(s):
+        return "'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+    try:
+        subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.Notifications",
+                        "--object-path", "/org/freedesktop/Notifications",
+                        "--method", "org.freedesktop.Notifications.Notify",
+                        gv(APP_NAME), "0", gv("video-display"), gv(summary), gv(body), "[]", "{}", "6000"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+# --- Inputs and settings -----------------------------------------------------------------------
+
+# VCP 0x60 input code: key, label, LG 0xF4 value (None = unknown)
+KNOWN_INPUTS = {
+    0x01: ("vga1", "VGA 1", None),
+    0x02: ("vga2", "VGA 2", None),
+    0x03: ("dvi1", "DVI 1", None),
+    0x04: ("dvi2", "DVI 2", None),
+    0x0F: ("dp1", "DisplayPort 1", 0xD0),
+    0x10: ("dp2", "DisplayPort 2", 0xD1),
+    0x11: ("hdmi1", "HDMI 1", 0x90),
+    0x12: ("hdmi2", "HDMI 2", 0x91),
+    0x1B: ("usbc", "USB-C", None),
+}
+
+
+class InputDef:
+    def __init__(self, code):
+        self.code = code
+        if code in KNOWN_INPUTS:
+            self.key, self.label, self.lg_value = KNOWN_INPUTS[code]
+        else:
+            self.key, self.label, self.lg_value = "input%02x" % code, "Input 0x%02X" % code, None
+        self.hotkey = ""
+        self.hidden = False
+
+
+class Config:
+    # Same format as the Windows version's lg-input-switcher.ini:
+    #   [monitor]  edid, model and inputs (detected from the monitor)
+    #   [hotkeys]  hdmi1 = Ctrl+Alt+2
+    #   [menu]     hide = dp2
+    #   [block]    programs = Overwatch.exe
+    def __init__(self):
+        self.edid_id = ""  # empty: the first LG monitor found
+        self.model = ""
+        self.input_codes = []
+        self.hotkeys = {}
+        self.hidden = set()
+        self.block_programs = []
+
+    @staticmethod
+    def load(path=None):
+        path = path or CONFIG_PATH
+        if os.path.exists(path):
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return Config.parse(f.read().splitlines())
+        # First run: default shortcuts; the inputs themselves are detected from the monitor.
+        cfg = Config()
+        cfg.hotkeys = {"dp1": "Ctrl+Alt+1", "hdmi1": "Ctrl+Alt+2", "hdmi2": "Ctrl+Alt+3"}
+        return cfg
+
+    @staticmethod
+    def parse(lines):
+        cfg = Config()
+        section = ""
+        for raw in lines:
+            line = raw.strip()
+            if not line or line.startswith(";") or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip().lower()
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key, val = key.strip().lower(), val.strip()
+            if section == "monitor":
+                if key == "edid":
+                    cfg.edid_id = val
+                elif key == "model":
+                    cfg.model = val
+                elif key == "inputs":
+                    # Skip malformed codes rather than failing the whole file.
+                    for c in re.split(r"[ ,]+", val):
+                        try:
+                            code = int(c, 16)
+                        except ValueError:
+                            continue
+                        if 0 <= code <= 0xFF and code not in cfg.input_codes:
+                            cfg.input_codes.append(code)
+            elif section == "hotkeys" and val:
+                cfg.hotkeys[key] = val
+            elif section == "menu" and key == "hide":
+                cfg.hidden.update(h.lower() for h in re.split(r"[ ,]+", val) if h)
+            elif section == "block" and key == "programs":
+                cfg.block_programs.extend(p.strip() for p in val.split(",") if p.strip())
+        return cfg
+
+    def save(self, path=None):
+        path = path or CONFIG_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        out = [
+            "; %s settings. Edit by hand; the shortcut service picks up changes by itself." % APP_NAME,
+            "",
+            "[monitor]",
+            "; Detected from the monitor (EDID and DDC capabilities). Run \"lg-input-switcher detect\" to refresh.",
+            "edid = " + self.edid_id,
+            "model = " + self.model,
+            "inputs = " + " ".join("%02X" % c for c in self.input_codes),
+            "",
+            "[hotkeys]",
+            "; input = Ctrl/Alt/Shift/Win + a key name (1, F9, Home, NumPad1, ...)",
+        ]
+        out += ["%s = %s" % (k, v) for k, v in self.hotkeys.items() if v]
+        out += [
+            "",
+            "[menu]",
+            "; Inputs that get no shortcut (space-separated).",
+            "hide = " + " ".join(sorted(self.hidden)),
+            "",
+            "[block]",
+            "; Shortcuts do nothing while a window of one of these programs is selected (comma-separated).",
+            "; Running in the background or minimized doesn't count. Works for X11/XWayland windows,",
+            "; which includes Steam/Proton games; use the Windows name for those, e.g. Overwatch.exe.",
+            "programs = " + ", ".join(self.block_programs),
+        ]
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        os.replace(tmp, path)
+
+    @property
+    def inputs(self):
+        result = []
+        for code in self.input_codes:
+            d = InputDef(code)
+            d.hotkey = self.hotkeys.get(d.key, "")
+            d.hidden = d.key in self.hidden
+            result.append(d)
+        return result
+
+    def find(self, key):
+        key = {"dp": "dp1", "hdmi": "hdmi1"}.get(key.lower(), key.lower())
+        return next((i for i in self.inputs if i.key == key), None)
+
+    def is_blocked(self, names):
+        # Matches "Overwatch.exe" or "Overwatch" against any of the program's names.
+        def bare(n):
+            n = n.lower()
+            return n[:-4] if n.endswith(".exe") else n
+        for name in names:
+            if not name:
+                continue
+            for p in self.block_programs:
+                if p.lower() == name.lower() or bare(p) == bare(name):
+                    return p
+        return None
+
+
+def parse_byte(s):
+    s = s.strip()
+    return int(s[2:], 16) if s.lower().startswith("0x") else int(s)
+
+
+# --- Hotkeys -----------------------------------------------------------------------------------
+
+# Linux input key codes (linux/input-event-codes.h). Names follow the Windows version's .ini.
+MODIFIERS = {
+    "ctrl": (29, 97), "control": (29, 97),
+    "alt": (56, 100),
+    "shift": (42, 54),
+    "win": (125, 126), "windows": (125, 126), "meta": (125, 126), "super": (125, 126),
+}
+MODIFIER_ORDER = ("ctrl", "alt", "shift", "win")
+KEY_CODES = {}
+for _i, _c in enumerate("1234567890"):
+    KEY_CODES[_c] = KEY_CODES["d" + _c] = 2 + _i
+for _row, _start in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+    for _i, _c in enumerate(_row):
+        KEY_CODES[_c] = _start + _i
+for _i in range(10):
+    KEY_CODES["f%d" % (_i + 1)] = 59 + _i
+KEY_CODES.update({"f11": 87, "f12": 88})
+for _i in range(12):
+    KEY_CODES["f%d" % (_i + 13)] = 183 + _i
+for _i, _c in enumerate((82, 79, 80, 81, 75, 76, 77, 71, 72, 73)):
+    KEY_CODES["numpad%d" % _i] = _c
+KEY_CODES.update({
+    "multiply": 55, "add": 78, "subtract": 74, "divide": 98, "decimal": 83,
+    "home": 102, "end": 107, "pageup": 104, "prior": 104, "pagedown": 109, "next": 109,
+    "insert": 110, "delete": 111, "up": 103, "down": 108, "left": 105, "right": 106,
+    "space": 57, "tab": 15, "escape": 1, "esc": 1, "enter": 28, "return": 28,
+    "back": 14, "backspace": 14, "pause": 119, "scroll": 70, "printscreen": 99, "snapshot": 99,
+    "oemminus": 12, "oemplus": 13, "oemopenbrackets": 26, "oemclosebrackets": 27, "oem6": 27,
+    "oemsemicolon": 39, "oem1": 39, "oemquotes": 40, "oem7": 40, "oemtilde": 41, "oem3": 41,
+    "oempipe": 43, "oem5": 43, "oemcomma": 51, "oemperiod": 52, "oemquestion": 53, "oem2": 53,
+})
+
+
+def parse_hotkey(s):
+    # "Ctrl+Alt+1" -> (frozenset({"ctrl", "alt"}), 2), or None if not understood.
+    mods, key = set(), None
+    for token in (s or "").split("+"):
+        t = token.strip().lower()
+        if t in MODIFIERS:
+            mods.add({"control": "ctrl", "windows": "win", "meta": "win", "super": "win"}.get(t, t))
+        elif t in KEY_CODES and key is None:
+            key = KEY_CODES[t]
+        else:
+            return None
+    return (frozenset(mods), key) if key is not None else None
+
+
+# --- I2C / DDC ---------------------------------------------------------------------------------
+
+I2C_SLAVE = 0x0703
+I2C_SLAVE_FORCE = 0x0706
+EDID_ADDRESS = 0x50
+DDC_ADDRESS = 0x37             # 7-bit; 0x6E / 0x6F on the wire
+DDC_WRITE_ADDRESS = 0x6E
+LG_SOURCE_ADDRESS = 0x50
+STD_SOURCE_ADDRESS = 0x51
+LG_INPUT_VCP = 0xF4
+
+
+class I2cBus:
+    def __init__(self, number):
+        import fcntl  # Linux only; imported here so the rest can be tested anywhere
+        self._ioctl = fcntl.ioctl
+        self.number = number
+        self.path = "/dev/i2c-%d" % number
+        self.fd = os.open(self.path, os.O_RDWR)
+        self._address = None
+
+    def _select(self, address):
+        if self._address == address:
+            return
+        try:
+            self._ioctl(self.fd, I2C_SLAVE, address)
+        except OSError as e:
+            if e.errno != errno.EBUSY:
+                raise
+            self._ioctl(self.fd, I2C_SLAVE_FORCE, address)  # a kernel driver has claimed it
+        self._address = address
+
+    def write(self, address, data):
+        self._select(address)
+        os.write(self.fd, bytes(data))
+
+    def read(self, address, length):
+        self._select(address)
+        data = os.read(self.fd, length)
+        if len(data) != length:
+            raise OSError(errno.EIO, "short read")
+        return data
+
+    def close(self):
+        os.close(self.fd)
+
+
+def _sysfs_i2c(number, name):
+    try:
+        with open("/sys/bus/i2c/devices/i2c-%d/%s" % (number, name)) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def is_display_bus(number):
+    # Only buses that belong to a graphics card (PCI class 0x03xxxx). Others, like the
+    # motherboard's SMBus, have RAM and sensor chips that must not be poked.
+    path = os.path.realpath("/sys/bus/i2c/devices/i2c-%d" % number)
+    while path not in ("/", "/sys", "/sys/devices"):
+        try:
+            with open(os.path.join(path, "class")) as f:
+                return f.read().strip().startswith("0x03")
+        except OSError:
+            path = os.path.dirname(path)
+    return False
+
+
+def i2c_bus_numbers():
+    nums = []
+    for p in glob.glob("/dev/i2c-*"):
+        m = re.match(r"/dev/i2c-(\d+)$", p)
+        if m:
+            nums.append(int(m.group(1)))
+    return sorted(nums)
+
+
+def parse_edid_id(edid):
+    if edid is None or len(edid) < 12:
+        return None
+    m = (edid[8] << 8) | edid[9]
+    letters = "".join(chr(ord("A") - 1 + ((m >> s) & 0x1F)) for s in (10, 5, 0))
+    return "%s%04X" % (letters, edid[10] | (edid[11] << 8))
+
+
+def parse_edid_name(edid):
+    # Four 18-byte descriptors at 54; tag 0xFC is the monitor name.
+    for off in range(54, 126 - 17, 18):
+        if off + 18 <= len(edid) and edid[off] == 0 and edid[off + 1] == 0 and edid[off + 3] == 0xFC:
+            name = bytes(edid[off + 5:off + 18]).split(b"\n")[0]
+            return name.decode("ascii", "replace").strip()
+    return None
+
+
+class DisplayInfo:
+    def __init__(self, bus, adapter, edid_id, name):
+        self.bus, self.adapter, self.edid_id, self.name = bus, adapter, edid_id, name
+
+
+def list_displays(problems=None):
+    # Reads the EDID of every graphics-card I2C bus. problems collects buses that couldn't be opened.
+    result = []
+    for n in i2c_bus_numbers():
+        if not is_display_bus(n):
+            continue
+        try:
+            bus = I2cBus(n)
+        except OSError as e:
+            if problems is not None:
+                problems.append((n, e))
+            continue
+        try:
+            bus.write(EDID_ADDRESS, [0])
+            edid = bus.read(EDID_ADDRESS, 128)
+            if edid[:8] == b"\x00\xff\xff\xff\xff\xff\xff\x00":
+                result.append(DisplayInfo(n, _sysfs_i2c(n, "name"), parse_edid_id(edid), parse_edid_name(edid)))
+        except OSError:
+            pass  # nothing connected to this port
+        finally:
+            bus.close()
+    return result
+
+
+def access_help(problems):
+    if not i2c_bus_numbers():
+        return ("No /dev/i2c-* devices. Load the i2c-dev module:\n"
+                "  sudo modprobe i2c-dev\n"
+                "  echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf")
+    if any(e.errno in (errno.EACCES, errno.EPERM) for _, e in problems):
+        return ("No permission to use /dev/i2c-*. Run \"lg-input-switcher doctor\" for the fix.")
+    return None
+
+
+def checksum(dev_address, source, data):
+    chk = dev_address ^ source
+    for b in data[:-1]:
+        chk ^= b
+    return chk & 0xFF
+
+
+def reply_checksum_ok(reply):
+    length = reply[1] & 0x7F
+    if length + 3 > len(reply):
+        return False
+    chk = 0x50  # replies are checksummed against the host's virtual address 0x50
+    for b in reply[:length + 2]:
+        chk ^= b
+    return chk == reply[length + 2]
+
+
+class LgSwitcher:
+    def __init__(self, edid_id, open_bus=I2cBus, displays=list_displays):
+        self.edid_id = (edid_id or "").upper()
+        self._open_bus = open_bus
+        self._displays = displays
+        self._display = None
+        self._bus = None
+
+    def find_monitor(self, refresh=False):
+        # The bus is kept open; it's looked up again only after a transfer failed.
+        if self._bus is not None and not refresh:
+            return self._display
+        self.close()
+        problems = []
+        found = [d for d in self._displays(problems) if d.edid_id]
+        match = [d for d in found if d.edid_id.upper() == self.edid_id] if self.edid_id else \
+                [d for d in found if d.edid_id.upper().startswith("GSM")]  # GSM = LG (GoldStar)
+        if not match and self._display is not None:
+            match = [self._display]  # not reported right now; keep using the last known bus
+        if not match:
+            want = "Monitor " + self.edid_id if self.edid_id else "An LG monitor"
+            if found:
+                hint = "Monitors found: " + ", ".join("%s (%s)" % (d.edid_id, d.name or "?") for d in found)
+            else:
+                hint = access_help(problems) or "No monitor answered on the graphics card's DDC buses."
+            raise SwitchError("%s was not found. %s" % (want, hint))
+        self._display = match[0]
+        self._bus = self._open_bus(match[0].bus)
+        return self._display
+
+    def close(self):
+        if self._bus is not None:
+            try:
+                self._bus.close()
+            except OSError:
+                pass
+        self._bus = None
+
+    def switch_input(self, value):
+        # 0x84 = 0x80 | 4 data bytes, 0x03 = Set VCP Feature, VCP code, value high, value low, checksum
+        data = [0x84, 0x03, LG_INPUT_VCP, 0x00, value, 0x00]
+        data[-1] = checksum(DDC_WRITE_ADDRESS, LG_SOURCE_ADDRESS, data)
+        last = None
+        for attempt in range(3):
+            try:
+                self.find_monitor(attempt > 0)
+                self._bus.write(DDC_ADDRESS, [LG_SOURCE_ADDRESS] + data)
+                return self._display
+            except OSError as e:
+                log("I2C write attempt %d failed: %s", attempt + 1, e)
+                last = e
+                time.sleep(0.1)
+        raise SwitchError("I2C write failed: %s" % last)
+
+    # Always sends the switch: the LG's VCP 0x60 keeps reporting the DisplayPort input it's
+    # queried over even while it shows HDMI, so the current input can't be known.
+    def switch_to(self, inp):
+        if inp.lg_value is None:
+            raise SwitchError("Don't know LG's switch code for " + inp.label)
+        self.switch_input(inp.lg_value)
+
+    def _request(self, source, payload, reply_length, delay):
+        # Sends a DDC/CI request and reads the reply. A length byte of 0x80 is a null message
+        # (monitor busy) and a bad checksum is a garbled read; both are retried.
+        data = [0x80 | len(payload)] + list(payload) + [0]
+        data[-1] = checksum(DDC_WRITE_ADDRESS, source, data)
+        failed = False
+        reply = b""
+        for attempt in range(5):
+            try:
+                self.find_monitor(failed)
+                self._bus.write(DDC_ADDRESS, [source] + data)
+                time.sleep(delay)
+                reply = self._bus.read(DDC_ADDRESS, reply_length)
+                failed = False
+            except OSError:
+                if attempt == 4:
+                    raise
+                failed = True
+                time.sleep(0.1)
+                continue
+            if reply[1] != 0x80 and reply_checksum_ok(reply):
+                return reply
+            time.sleep(0.1)
+        raise SwitchError("No valid DDC reply: " + reply.hex("-").upper())
+
+    def read_vcp(self, vcp):
+        # DDC/CI "Get VCP Feature". Returns (current, max).
+        # Reply: src(0x6E) len(0x88) 0x02 result vcp type maxH maxL curH curL chk
+        r = self._request(STD_SOURCE_ADDRESS, [0x01, vcp], 11, 0.04)
+        if r[2] != 0x02 or r[4] != vcp:
+            raise SwitchError("Unexpected DDC reply: " + r.hex("-").upper())
+        if r[3] != 0x00:
+            raise SwitchError("Monitor reports VCP 0x%02X unsupported" % vcp)
+        return (r[8] << 8) | r[9], (r[6] << 8) | r[7]
+
+    def read_capabilities(self):
+        # DDC/CI "Capabilities Request", read in fragments, e.g. "(prot(monitor)type(LCD)model(...)vcp(10 12 60(0F 11 12) ...))".
+        out = []
+        offset = 0
+        while offset < 4096:
+            # Reply: src len 0xE3 offH offL data... chk (up to 32 data bytes)
+            r = self._request(STD_SOURCE_ADDRESS, [0xF3, offset >> 8, offset & 0xFF], 38, 0.06)
+            length = (r[1] & 0x7F) - 3
+            if r[2] != 0xE3 or length < 0 or length > 32 or ((r[3] << 8) | r[4]) != offset:
+                raise SwitchError("Unexpected capabilities reply: " + r.hex("-").upper())
+            if length == 0:
+                break
+            out.extend(chr(b) for b in r[5:5 + length] if 0x20 <= b < 0x7F)
+            offset += length
+        return "".join(out)
+
+    def detect(self):
+        # Model name and the inputs the monitor reports (VCP 0x60 values in its capabilities string).
+        d = self.find_monitor()
+        caps = self.read_capabilities()
+        m = re.search(r"model\(([^)]*)\)", caps)
+        model = (d.name or d.edid_id) + (" (%s)" % m.group(1).strip() if m else "")
+        v = re.search(r"(?<![0-9A-Fa-f])60\(([0-9A-Fa-f ]*)\)", caps)
+        if not v:
+            raise SwitchError("Monitor doesn't report its inputs: " + caps)
+        return d, model, [int(c, 16) for c in v.group(1).split()]
+
+
+def detect_into(cfg, switcher):
+    d, model, inputs = switcher.detect()
+    cfg.edid_id, cfg.model, cfg.input_codes = d.edid_id, model, inputs
+    cfg.save()
+    return cfg
+
+
+# --- Selected window (for [block]) -------------------------------------------------------------
+
+def _x11_auth_files():
+    files = [os.environ.get("XAUTHORITY", "")]
+    run = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+    # KDE's and GNOME's Xwayland cookies, newest first, then the classic file.
+    files += sorted(glob.glob(os.path.join(run, "xauth_*")) + glob.glob(os.path.join(run, ".mutter-Xwaylandauth.*")),
+                    key=lambda p: -os.path.getmtime(p) if os.path.exists(p) else 0)
+    files.append(os.path.join(os.path.expanduser("~"), ".Xauthority"))
+    return [f for f in files if f and os.path.isfile(f)]
+
+
+def _x11_cookies(display):
+    # MIT-MAGIC-COOKIE-1 entries for this display number from the Xauthority files.
+    cookies = []
+    for path in _x11_auth_files():
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        pos = 0
+        try:
+            while pos + 2 <= len(data):
+                family = struct.unpack_from(">H", data, pos)[0]
+                pos += 2
+                fields = []
+                for _ in range(4):
+                    n = struct.unpack_from(">H", data, pos)[0]
+                    fields.append(data[pos + 2:pos + 2 + n])
+                    pos += 2 + n
+                _, number, name, cookie = fields
+                if name == b"MIT-MAGIC-COOKIE-1" and number in (str(display).encode(), b"") and family in (256, 65535, 0):
+                    cookies.append(cookie)
+        except struct.error:
+            pass
+    return cookies
+
+
+def _pad4(n):
+    return (4 - n % 4) % 4
+
+
+class X11:
+    # Just enough of the X11 protocol to read two window properties, so no extra packages are needed.
+    def __init__(self, display):
+        last = None
+        for cookie in _x11_cookies(display) + [b""]:
+            try:
+                self._connect(display, cookie)
+                return
+            except (OSError, ValueError, IndexError, struct.error) as e:
+                last = e
+                if getattr(self, "sock", None):
+                    self.sock.close()
+        raise last or OSError("X11 connection failed")
+
+    def _connect(self, display, cookie):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(1)
+        try:
+            self.sock.connect(X11_SOCKET % display)
+        except OSError:
+            self.sock.close()
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(1)
+            self.sock.connect("\0/tmp/.X11-unix/X%d" % display)  # abstract socket
+        name = b"MIT-MAGIC-COOKIE-1" if cookie else b""
+        self.sock.sendall(struct.pack("<BxHHHHxx", ord("l"), 11, 0, len(name), len(cookie))
+                          + name + b"\0" * _pad4(len(name)) + cookie + b"\0" * _pad4(len(cookie)))
+        head = self._recv(8)
+        extra = self._recv(struct.unpack_from("<H", head, 6)[0] * 4)
+        if head[0] != 1:
+            self.sock.close()
+            raise ValueError("X11 connection refused")
+        vendor_len = struct.unpack_from("<H", extra, 16)[0]
+        formats = extra[21]
+        self.root = struct.unpack_from("<I", extra, 32 + vendor_len + _pad4(vendor_len) + 8 * formats)[0]
+        self._atoms = {}
+
+    def _recv(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise OSError("X11 connection closed")
+            buf += chunk
+        return buf
+
+    def _reply(self):
+        while True:
+            head = self._recv(32)
+            if head[0] == 0:
+                raise OSError("X11 error %d" % head[1])
+            if head[0] == 1:
+                return head + self._recv(struct.unpack_from("<I", head, 4)[0] * 4)
+            # an event; ignore
+
+    def atom(self, name):
+        if name not in self._atoms:
+            n = name.encode()
+            self.sock.sendall(struct.pack("<BBHHxx", 16, 0, 2 + (len(n) + _pad4(len(n))) // 4, len(n))
+                              + n + b"\0" * _pad4(len(n)))
+            self._atoms[name] = struct.unpack_from("<I", self._reply(), 8)[0]
+        return self._atoms[name]
+
+    def cardinal(self, window, prop):
+        # First 32-bit value of a property, or None.
+        self.sock.sendall(struct.pack("<BBHIIIII", 20, 0, 6, window, self.atom(prop), 0, 0, 1))
+        r = self._reply()
+        fmt, length = r[1], struct.unpack_from("<I", r, 16)[0]
+        return struct.unpack_from("<I", r, 32)[0] if fmt == 32 and length >= 1 else None
+
+    def close(self):
+        self.sock.close()
+
+
+def _x11_displays():
+    nums = []
+    m = re.match(r"^(?:unix)?:(\d+)", os.environ.get("DISPLAY", ""))
+    if m:
+        nums.append(int(m.group(1)))
+    for p in sorted(glob.glob("/tmp/.X11-unix/X*")):
+        m = re.match(r".*/X(\d+)$", p)
+        if m and int(m.group(1)) not in nums:
+            nums.append(int(m.group(1)))
+    return nums
+
+
+def process_names(pid):
+    # Names a program may be listed under: its process name, its file name, and for Wine/Proton
+    # games the Windows .exe name (e.g. "Overwatch.exe").
+    names = []
+    try:
+        with open("/proc/%d/comm" % pid) as f:
+            names.append(f.read().strip())
+    except OSError:
+        pass
+    try:
+        names.append(os.path.basename(os.readlink("/proc/%d/exe" % pid)))
+    except OSError:
+        pass
+    try:
+        with open("/proc/%d/cmdline" % pid, "rb") as f:
+            argv0 = f.read().split(b"\0")[0].decode("utf-8", "replace")
+        names.append(re.split(r"[\\/]", argv0)[-1])
+    except OSError:
+        pass
+    return [n for n in names if n]
+
+
+def selected_program():
+    # Names of the program whose window is selected, if it's an X11 window (XWayland included,
+    # which is where Steam/Proton games run). A selected native Wayland window can't be seen: [].
+    for display in _x11_displays():
+        try:
+            x = X11(display)
+        except Exception:
+            continue
+        try:
+            window = x.cardinal(x.root, "_NET_ACTIVE_WINDOW")
+            pid = x.cardinal(window, "_NET_WM_PID") if window else None
+        except Exception:
+            continue
+        finally:
+            x.close()
+        if pid:
+            return process_names(pid)
+    return []
+
+
+# --- Keyboard (evdev) ---------------------------------------------------------------------------
+
+EV_KEY = 0x01
+EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit Linux
+
+
+def _ioc_read(nr, size):
+    return (2 << 30) | (size << 16) | (ord("E") << 8) | nr
+
+
+EVIOCGBIT_KEY = _ioc_read(0x20 + EV_KEY, 96)   # which keys the device has
+EVIOCGKEY = _ioc_read(0x18, 96)                # which keys are held down right now
+EVIOCGNAME = _ioc_read(0x06, 256)
+
+
+def _bit(buf, n):
+    return bool(buf[n // 8] & (1 << (n % 8)))
+
+
+class Keyboards:
+    # Reads every keyboard directly (/dev/input/event*), so the shortcuts work on KDE, GNOME and in
+    # Steam's Game Mode alike. Keys still reach the selected program; nothing is grabbed.
+    def __init__(self):
+        import fcntl
+        self._ioctl = fcntl.ioctl
+        self.devices = {}       # path -> fd
+        self.denied = []
+        self._ignored = set()   # paths that aren't keyboards
+
+    def rescan(self):
+        self.denied = []
+        paths = glob.glob("/dev/input/event*")
+        self._ignored &= set(paths)  # a node's number can be reused by a newly plugged-in device
+        for path in paths:
+            if path in self.devices or path in self._ignored:
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                if e.errno in (errno.EACCES, errno.EPERM):
+                    self.denied.append(path)
+                continue
+            try:
+                keys = bytearray(96)
+                self._ioctl(fd, EVIOCGBIT_KEY, keys)
+                is_keyboard = _bit(keys, 30) and _bit(keys, 29)  # has A and Ctrl
+            except OSError:
+                is_keyboard = False
+            if is_keyboard:
+                self.devices[path] = fd
+                log("Keyboard: %s (%s)", self._name(fd), path)
+            else:
+                os.close(fd)
+                self._ignored.add(path)
+
+    def _name(self, fd):
+        buf = bytearray(256)
+        try:
+            self._ioctl(fd, EVIOCGNAME, buf)
+        except OSError:
+            return "?"
+        return buf.split(b"\0")[0].decode("utf-8", "replace")
+
+    def held_modifiers(self):
+        # Asked from the devices at the moment of the key press, so a missed release can't leave a
+        # modifier stuck. Modifiers on one keyboard combine with a key on another.
+        held = set()
+        for fd in list(self.devices.values()):
+            state = bytearray(96)
+            try:
+                self._ioctl(fd, EVIOCGKEY, state)
+            except OSError:
+                continue
+            for name in MODIFIER_ORDER:
+                if any(_bit(state, c) for c in MODIFIERS[name]):
+                    held.add(name)
+        return frozenset(held)
+
+    def read_presses(self, timeout):
+        # Key codes pressed (not repeated or released) within timeout seconds.
+        if not self.devices:
+            time.sleep(timeout)
+            return []
+        ready, _, _ = select.select(list(self.devices.values()), [], [], timeout)
+        presses = []
+        for fd in ready:
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except OSError as e:
+                if e.errno == errno.EAGAIN:
+                    continue
+                self._drop(fd)  # unplugged
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, etype, code, value = EVENT.unpack_from(data, off)
+                if etype == EV_KEY and value == 1:
+                    presses.append(code)
+        return presses
+
+    def _drop(self, fd):
+        for path, f in list(self.devices.items()):
+            if f == fd:
+                del self.devices[path]
+                log("Keyboard removed: %s", path)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+# --- Shortcut service --------------------------------------------------------------------------
+
+class Daemon:
+    def __init__(self, keyboards=None, create_switcher=LgSwitcher, selected=selected_program):
+        self.keyboards = keyboards
+        self.create_switcher = create_switcher
+        self.selected = selected
+        self.cfg = None
+        self.switcher = None
+        self.bindings = {}      # (mods, key) -> InputDef
+        self._mtime = None
+        self._next_detect = 0
+        self._warned_denied = False
+
+    def load(self):
+        try:
+            self._mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else None
+            self.cfg = Config.load()
+        except (OSError, UnicodeError) as e:
+            log("Could not read %s: %s", CONFIG_PATH, e)
+            notify("Settings file not read", str(e))
+            self.cfg = self.cfg or Config()
+        if self.switcher is None or self.switcher.edid_id != self.cfg.edid_id.upper():
+            if self.switcher:
+                self.switcher.close()
+            self.switcher = self.create_switcher(self.cfg.edid_id)
+        self.bindings = {}
+        active, failed = [], []
+        for inp in self.cfg.inputs:
+            if inp.hidden or inp.lg_value is None or not inp.hotkey:
+                continue
+            hk = parse_hotkey(inp.hotkey)
+            if hk is None:
+                failed.append(inp.hotkey + " (not understood)")
+            elif hk in self.bindings:
+                failed.append(inp.hotkey + " (already used for " + self.bindings[hk].label + ")")
+            else:
+                self.bindings[hk] = inp
+                active.append("%s = %s" % (inp.hotkey, inp.label))
+        log("Shortcuts active: %s%s; blocked programs: %s",
+            ", ".join(active) or "none",
+            "; NOT registered: " + ", ".join(failed) if failed else "",
+            ", ".join(self.cfg.block_programs) or "none")
+        if failed:
+            notify("Some shortcuts were not registered", "\n".join(failed))
+
+    def config_changed(self):
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else None
+        except OSError:
+            return False
+        return mtime != self._mtime
+
+    def detect_if_needed(self):
+        # The inputs are cached in the ini; until they're known, retry every 30 s.
+        if self.cfg.input_codes or time.monotonic() < self._next_detect:
+            return
+        self._next_detect = time.monotonic() + 30
+        try:
+            detect_into(self.cfg, self.switcher)
+            log("Detected %s: inputs %s", self.cfg.model, " ".join("%02X" % c for c in self.cfg.input_codes))
+            self.load()
+        except (OSError, SwitchError) as e:
+            log("Couldn't read the monitor's inputs: %s", e)
+
+    def on_press(self, key):
+        if not any(k == key for _, k in self.bindings):
+            return
+        inp = self.bindings.get((self.keyboards.held_modifiers(), key))
+        if inp is None:
+            return
+        names = self.selected()
+        # Never switch away from a blocked program (e.g. a game) while its window is selected.
+        blocked = self.cfg.is_blocked(names)
+        if blocked:
+            log("Shortcut %s (%s): blocked, selected window belongs to %s", inp.hotkey, inp.label, blocked)
+            return
+        try:
+            self.switcher.switch_to(inp)
+            log("Shortcut %s: switched to %s (selected window: %s)", inp.hotkey, inp.label, names[0] if names else "none/Wayland")
+        except (OSError, SwitchError) as e:
+            log("Shortcut %s: could not switch to %s: %s", inp.hotkey, inp.label, e)
+            notify("Could not switch to " + inp.label, str(e))
+
+    def run(self):
+        log("Started")
+        self.load()
+        if self.keyboards is None:
+            self.keyboards = Keyboards()
+        last_scan = 0
+        while True:
+            if time.monotonic() - last_scan > 3:  # keyboards plugged in later
+                self.keyboards.rescan()
+                last_scan = time.monotonic()
+                if not self.keyboards.devices and self.keyboards.denied and not self._warned_denied:
+                    self._warned_denied = True
+                    msg = "No permission to read the keyboard. Run: ujust add-user-to-input-group add, then restart the PC."
+                    log(msg)
+                    notify("Shortcuts are off", msg)
+            if self.config_changed():
+                self.load()
+            self.detect_if_needed()
+            for key in self.keyboards.read_presses(1.0):
+                self.on_press(key)
+
+
+# --- Install -----------------------------------------------------------------------------------
+
+UNIT = """[Unit]
+Description=%s (keyboard shortcuts)
+
+[Service]
+ExecStart=%s daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""" % (APP_NAME, BIN_PATH)
+
+
+def _systemctl(*args):
+    return subprocess.run(["systemctl", "--user"] + list(args), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          universal_newlines=True)
+
+
+def install(cfg):
+    if os.geteuid() == 0:
+        print("Run install as your normal user, without sudo (it installs into your home folder).")
+        return 1
+    if not cfg.input_codes:
+        try:
+            detect_into(cfg, LgSwitcher(cfg.edid_id))
+            print("Monitor: %s" % cfg.model)
+        except (OSError, SwitchError) as e:
+            print("Couldn't read the monitor yet (%s)\nThe service will retry; see the checks below.\n" % e)
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    me = os.path.realpath(sys.argv[0])
+    if me != os.path.realpath(BIN_PATH):
+        shutil.copyfile(me, BIN_PATH)
+    os.chmod(BIN_PATH, 0o755)
+    print("Installed " + BIN_PATH)
+
+    # App-menu entries, one per input. Also usable as desktop shortcuts if you'd rather not let the
+    # service read the keyboard (System Settings > Keyboard > Shortcuts > Add New > Application).
+    os.makedirs(APPS_DIR, exist_ok=True)
+    for old in glob.glob(os.path.join(APPS_DIR, APP_ID + "-*.desktop")):
+        os.remove(old)
+    for inp in cfg.inputs or [InputDef(c) for c in (0x0F, 0x11, 0x12)]:
+        if inp.lg_value is None:
+            continue
+        with open(os.path.join(APPS_DIR, "%s-%s.desktop" % (APP_ID, inp.key)), "w") as f:
+            f.write("[Desktop Entry]\nType=Application\nName=LG monitor: %s\n"
+                    "Comment=Switch the LG monitor to %s\nExec=%s --shortcut %s\n"
+                    "Icon=video-display\nTerminal=false\nStartupNotify=false\nCategories=Utility;\n"
+                    % (inp.label, inp.label, BIN_PATH, inp.key))
+    print("Added app-menu entries (LG monitor: ...)")
+
+    os.makedirs(os.path.dirname(UNIT_PATH), exist_ok=True)
+    with open(UNIT_PATH, "w") as f:
+        f.write(UNIT)
+    _systemctl("daemon-reload")
+    r = _systemctl("enable", "--now", APP_ID + ".service")
+    _systemctl("restart", APP_ID + ".service")
+    print("Shortcut service " + ("started; it starts at every login." if r.returncode == 0 else "NOT started:\n" + r.stdout))
+    print()
+    return doctor(cfg)
+
+
+def uninstall():
+    _systemctl("disable", "--now", APP_ID + ".service")
+    for path in [UNIT_PATH, BIN_PATH] + glob.glob(os.path.join(APPS_DIR, APP_ID + "-*.desktop")):
+        if os.path.exists(path):
+            os.remove(path)
+            print("Removed " + path)
+    _systemctl("daemon-reload")
+    print("Settings kept in " + CONFIG_DIR)
+    return 0
+
+
+def doctor(cfg):
+    ok = True
+
+    def report(good, text, fix=None):
+        print(("  ok   " if good else "  FIX  ") + text)
+        if fix and not good:
+            for line in fix.splitlines():
+                print("         " + line)
+        return good
+
+    print("Monitor:")
+    buses = [n for n in i2c_bus_numbers() if is_display_bus(n)]
+    ok &= report(bool(i2c_bus_numbers()), "i2c-dev module loaded",
+                 "sudo modprobe i2c-dev\necho i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf")
+    if i2c_bus_numbers():
+        ok &= report(bool(buses), "graphics card I2C buses: " + (", ".join("i2c-%d" % n for n in buses) or "none"),
+                     "The graphics driver exposes no I2C buses. NVIDIA: make sure the proprietary driver is in use.")
+    denied = [n for n in buses if not os.access("/dev/i2c-%d" % n, os.R_OK | os.W_OK)]
+    if buses:
+        ok &= report(not denied, "permission to use them",
+                     "Allow your login to use the graphics card's I2C buses, then restart the PC:\n"
+                     "echo 'SUBSYSTEM==\"i2c-dev\", KERNEL==\"i2c-[0-9]*\", ATTRS{class}==\"0x03*\", TAG+=\"uaccess\"' \\\n"
+                     "  | sudo tee /etc/udev/rules.d/60-lg-input-switcher.rules")
+    if buses and not denied:
+        switcher = LgSwitcher(cfg.edid_id)
+        try:
+            d = switcher.find_monitor()
+            report(True, "monitor found: %s %s on i2c-%d (%s)" % (d.edid_id, d.name or "", d.bus, d.adapter))
+            try:
+                cur, mx = switcher.read_vcp(0x10)
+                report(True, "DDC/CI works (brightness %d / %d)" % (cur, mx))
+            except (OSError, SwitchError) as e:
+                ok &= report(False, "DDC/CI read failed: %s" % e,
+                             "Turn on DDC/CI in the monitor's menu (Settings > General), if it has the option.\n"
+                             "NVIDIA: if it still fails, see the README's troubleshooting section.")
+        except (OSError, SwitchError) as e:
+            ok &= report(False, str(e))
+        finally:
+            switcher.close()
+
+    print("Shortcuts:")
+    groups = os.getgroups()
+    try:
+        import grp
+        in_input = grp.getgrnam("input").gr_gid in groups
+    except (ImportError, KeyError):
+        in_input = False
+    events = glob.glob("/dev/input/event*")
+    readable = any(os.access(p, os.R_OK) for p in events)
+    ok &= report(readable, "permission to read the keyboard" + ("" if readable or not in_input else " (group added; restart the PC)"),
+                 None if in_input else "ujust add-user-to-input-group add    (then restart the PC)")
+    r = _systemctl("is-active", APP_ID + ".service")
+    active = r.stdout.strip() == "active"
+    ok &= report(active, "shortcut service running" if active else "shortcut service not running (%s)" % r.stdout.strip(),
+                 "lg-input-switcher install")
+    for inp in cfg.inputs:
+        if inp.hotkey and not inp.hidden and inp.lg_value is not None:
+            print("         %-12s %s" % (inp.hotkey, inp.label))
+    print()
+    print("Settings: " + CONFIG_PATH)
+    print("Log:      " + LOG_PATH)
+    return 0 if ok else 1
+
+
+# --- Command line ------------------------------------------------------------------------------
+
+def print_inputs(cfg):
+    print("Inputs reported by the monitor:")
+    for i in cfg.inputs:
+        note = "(switch code unknown)" if i.lg_value is None else "(no shortcut, hidden)" if i.hidden else ""
+        print("  %-7s %-15s %-12s %s" % (i.key, i.label, i.hotkey, note))
+
+
+def usage(cfg):
+    print("Usage: lg-input-switcher <input> | detect | list | doctor | install | uninstall | daemon")
+    print("                         probe | caps | get <vcp> | 0xNN")
+    print()
+    if cfg.input_codes:
+        print_inputs(cfg)
+
+
+def main(argv):
+    cfg = Config.load()
+    from_shortcut = bool(argv) and argv[0] == "--shortcut"
+    if from_shortcut:
+        argv = argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        usage(cfg)
+        return 0 if argv else 2
+    cmd = argv[0].lower()
+
+    if cmd == "list":
+        problems = []
+        displays = list_displays(problems)
+        for d in displays:
+            mine = d.edid_id and d.edid_id.upper() == cfg.edid_id.upper()
+            print("i2c-%-3d edid=%-8s name=%-16s %s%s" % (d.bus, d.edid_id or "?", d.name or "?", d.adapter,
+                                                         "  <- configured monitor" if mine else ""))
+        hint = access_help(problems)
+        if hint:
+            print(hint, file=sys.stderr)
+        return 0 if displays else 1
+    if cmd == "doctor":
+        return doctor(cfg)
+    if cmd == "install":
+        return install(cfg)
+    if cmd == "uninstall":
+        return uninstall()
+    if cmd == "daemon":
+        try:
+            Daemon().run()
+        except KeyboardInterrupt:
+            return 0
+
+    switcher = LgSwitcher(cfg.edid_id)
+    if cmd == "probe":
+        # Read-only DDC check: reads brightness (VCP 0x10) over the same I2C path.
+        print("DDC OK: brightness %d / %d" % switcher.read_vcp(0x10))
+        return 0
+    if cmd == "caps":
+        print(switcher.read_capabilities())
+        return 0
+    if cmd == "get" and len(argv) >= 2:
+        cur, mx = switcher.read_vcp(parse_byte(argv[1]))
+        print("VCP %s: current 0x%04X max 0x%04X" % (argv[1], cur, mx))
+        return 0
+    if cmd.startswith("0x"):
+        # Raw LG 0xF4 value, sent as-is (for experimenting with other models).
+        raw = parse_byte(cmd)
+        switcher.switch_input(raw)
+        print("Sent LG input value 0x%02X" % raw)
+        return 0
+    if cmd == "detect" or not cfg.input_codes:
+        detect_into(cfg, switcher)
+        if cmd == "detect":
+            print(cfg.model)
+            print_inputs(cfg)
+            return 0
+
+    inp = cfg.find(cmd)
+    if inp is None:
+        usage(cfg)
+        return 2
+    if from_shortcut:
+        # Started by a desktop shortcut: same rule as the service's shortcuts.
+        names = selected_program()
+        blocked = cfg.is_blocked(names)
+        if blocked:
+            log("Shortcut for %s: blocked, selected window belongs to %s", inp.label, blocked)
+            return 0
+    switcher.switch_to(inp)
+    if from_shortcut:
+        log("Shortcut: switched to %s", inp.label)
+    print("Switched to " + inp.label)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (OSError, SwitchError) as e:
+        print("Error: %s" % e, file=sys.stderr)
+        if "--shortcut" in sys.argv:
+            notify("Could not switch input", str(e))
+        sys.exit(1)
